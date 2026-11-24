@@ -1145,167 +1145,259 @@ app.get("/GetApplyCount/:email", async (req, res) => {
 //=============================================================
 //STRIPE AR SESSION AND CHEKING AND ROSID SAVE TO BACKEND
 //========================================================
-// হিন্ট (কী): বর্তমান সময় অনুযায়ী ইউজারের প্ল্যান সক্রিয় (active) কি না তা হিসাব করার helper।
-// হিন্ট (কেন): মেয়াদ শেষ (planExpiresAt < now) হলে যেন সিস্টেম সাথে সাথে প্ল্যানকে inactive ধরে এবং রশিদ না বদলায়।
-// হিন্ট (কীভাবে): planExpiresAt তারিখ থাকলে বর্তমান সময়ের (Date.now()) সাথে তুলনা করে true/false ফেরত দেয়।
+// হিন্ট: বর্তমান সময় অনুযায়ী ইউজারের প্ল্যান সক্রিয় (active) কি না তা চেক করার helper।
+// হিন্ট: মেয়াদ শেষ হলে প্ল্যান যেন সাথে সাথে inactive দেখায়।
+// হিন্ট: planExpiresAt-এর সাথে Date.now() তুলনা করা হয়েছে।
 function isPlanActive(planExpiresAt) {
-  if (!planExpiresAt) return false;
-  return new Date(planExpiresAt).getTime() > Date.now();
+  return Boolean(planExpiresAt) && new Date(planExpiresAt).getTime() > Date.now();
 }
 
-// হিন্ট (কী): Checkout শুরু হলে payment: false দিয়ে pending রেকর্ড সেভ করার route।
-// হিন্ট (কেন): ইউজার Stripe পেজে গিয়ে পেমেন্ট না করে ব্যাক করলে রেকর্ডটি payment: false-ই থেকে যায়।
-// হিন্ট (কীভাবে): StudentAndTeacherPaymentsStutus কালেকশনে payment: false দিয়ে insertOne করা হচ্ছে।
-app.post("/PaymentPending", async (req, res) => {
-  const { email, name, image, role, planKey, durationDays, returnTo } =
-    req.body;
+// হিন্ট: Stripe redirect-এর জন্য অ্যাপের base URL পরিষ্কারভাবে নেওয়া হচ্ছে।
+// হিন্ট: শেষে extra slash থাকলে ভুল URL তৈরি হতে পারে।
+// হিন্ট: .replace(/\/+$/, "") দিয়ে শেষের slash কাটা হয়েছে।
+const APP_URL = (
+  process.env.NEXT_PUBLIC_APP_URL 
+).replace(/\/+$/, "");
 
-  if (!email || !planKey) {
-    return res.status(400).json({ error: "email and planKey are required" });
-  }
+// হিন্ট: নির্বাচিত প্ল্যানের জন্য Stripe Checkout Session তৈরি করা হচ্ছে।
+// হিন্ট: ইউজারকে Stripe-এর payment card পেজে পাঠানোর জন্য session.url দরকার।
+// হিন্ট: stripe.checkout.sessions.create() কল করে metadata-সহ URL ফেরত দেওয়া হয়েছে।
+app.post("/CreateCheckoutSession", async (req, res) => {
+  try {
+    const {
+      email,
+      name,
+      image,
+      role,
+      planKey,
+      planLabel,
+      amount,
+      currency = "usd",
+      durationDays = 30,
+      returnTo = "/",
+    } = req.body || {};
 
-  const result = await StudentAndTeacherPaymentsStutus.insertOne({
-    email: String(email).toLowerCase(),
-    name: name || "",
-    image: image || "",
-    role: role || "student",
-    planKey,
-    durationDays: Number(durationDays) || 30,
-    payment: false,
-    status: "pending",
-    returnTo: returnTo || "/",
-    createdAt: new Date(),
-  });
-
-  return res.status(201).json({
-    insertedId: result.insertedId,
-    payment: false,
-  });
-});
-
-// হিন্ট (কী): Stripe থেকে পেমেন্ট সত্যিই হয়েছে কি না যাচাই করে payment: true, মেয়াদ ও রশিদ সেভ করার route।
-// হিন্ট (কেন): টাকা পরিশোধ হলেই কেবল payment: true হবে, ৩০ বা ৯০ দিনের মেয়াদ বসবে এবং রশিদ তৈরি হবে।
-// হিন্ট (কীভাবে): sessionId দিয়ে Stripe চেক করে paid হলে payments ও user কালেকশন আপডেট করা হচ্ছে।
-app.post("/VerifyPayment", async (req, res) => {
-  const { sessionId, email } = req.body;
-
-  if (!sessionId) {
-    return res.status(400).json({ error: "sessionId is required" });
-  }
-
-  const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-  if (session.payment_status !== "paid") {
-    return res.status(400).json({
-      verified: false,
-      payment: false,
-      message: "Payment is not completed yet",
-    });
-  }
-
-  const meta = session.metadata || {};
-  const userEmail = String(
-    email || meta.email || session.customer_email || ""
-  ).toLowerCase();
-
-  if (!userEmail) {
-    return res.status(400).json({ error: "User email is missing" });
-  }
-
-  const durationDays = Number(meta.durationDays) || 30;
-  const now = new Date();
-  const planExpiresAt = new Date(
-    now.getTime() + durationDays * 24 * 60 * 60 * 1000
-  );
-
-  const userDoc = await UsersData.findOne({ email: userEmail });
-  const userName = meta.name || userDoc?.name || "";
-  const userImage = meta.image || userDoc?.image || "";
-
-  const receipt = {
-    receiptId: `RCPT-${session.id.slice(-8).toUpperCase()}`,
-    sessionId: session.id,
-    email: userEmail,
-    name: userName,
-    image: userImage,
-    role: meta.role || userDoc?.role || "student",
-    planKey: meta.planKey || "student_1m",
-    durationDays,
-    amountTotal: session.amount_total ? session.amount_total / 100 : 0,
-    currency: (session.currency || "usd").toUpperCase(),
-    payment: true,
-    status: "paid",
-    paidAt: now,
-    planExpiresAt,
-    returnTo: meta.returnTo || "/",
-  };
-
-  await StudentAndTeacherPaymentsStutus.updateOne(
-    { email: userEmail, payment: false, status: "pending" },
-    { $set: receipt },
-    { upsert: true }
-  );
-
-  await UsersData.updateOne(
-    { email: userEmail },
-    {
-      $set: {
-        activePlanKey: receipt.planKey,
-        planExpiresAt,
-        updatedAt: now,
-      },
+    if (!email || !planKey || !amount) {
+      return res
+        .status(400)
+        .json({ error: "email, planKey, and amount are required" });
     }
-  );
 
-  return res.status(200).json({
-    verified: true,
-    payment: true,
-    isActivePlan: true,
-    receipt,
-    returnTo: receipt.returnTo,
-  });
+    const cleanEmail = String(email).toLowerCase();
+    const days = Number(durationDays) || 30;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: cleanEmail,
+      line_items: [
+        {
+          price_data: {
+            currency: String(currency).toLowerCase(),
+            product_data: { name: planLabel || planKey },
+            unit_amount: Math.round(Number(amount) * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        email: cleanEmail,
+        name: name || "",
+        image: image || "",
+        role: role || "student",
+        planKey,
+        durationDays: String(days),
+        returnTo,
+      },
+      success_url: `${APP_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL}/pricing`,
+    });
+
+    return res.status(200).json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error("POST /CreateCheckoutSession error:", err);
+    return res.status(500).json({ error: "Failed to create Stripe session" });
+  }
 });
 
-// হিন্ট (কী): ইউজারের বর্তমান প্ল্যান active কি না এবং কবে শেষ হবে তা জানানোর route।
-// হিন্ট (কেন): মেয়াদ শেষ হলে ব্যাকএন্ড থেকে inactive দেখাতে (পুরনো রশিদ payment: true রেখেই)।
-// হিন্ট (কীভাবে): UsersData থেকে planExpiresAt পড়ে isPlanActive() দিয়ে চেক করা হচ্ছে।
+// হিন্ট: Checkout শুরু হলে payment: false দিয়ে pending রেকর্ড সেভ করা হচ্ছে।
+// হিন্ট: পেমেন্ট না করে ব্যাক করলে রেকর্ডটি pending অবস্থায় থেকে যায়।
+// হিন্ট: StudentAndTeacherPaymentsStutus কালেকশনে insertOne করা হয়েছে।
+app.post("/PaymentPending", async (req, res) => {
+  try {
+    const { email, name, image, role, planKey, durationDays, returnTo } =
+      req.body || {};
+
+    if (!email || !planKey) {
+      return res.status(400).json({ error: "email and planKey are required" });
+    }
+
+    const result = await StudentAndTeacherPaymentsStutus.insertOne({
+      email: String(email).toLowerCase(),
+      name: name || "",
+      image: image || "",
+      role: role || "student",
+      planKey,
+      durationDays: Number(durationDays) || 30,
+      payment: false,
+      status: "pending",
+      returnTo: returnTo || "/",
+      createdAt: new Date(),
+    });
+
+    return res.status(201).json({
+      insertedId: result.insertedId,
+      payment: false,
+    });
+  } catch (err) {
+    console.error("POST /PaymentPending error:", err);
+    return res.status(500).json({ error: "Failed to save pending payment" });
+  }
+});
+
+// হিন্ট: Stripe পেমেন্ট যাচাই করে রশিদ সেভ ও ইউজারের প্ল্যান মেয়াদ আপডেট করা হচ্ছে।
+// হিন্ট: পেমেন্ট সফল হলেই কেবল রশিদ তৈরি হবে এবং মেয়াদ বাড়বে।
+// হিন্ট: session.id দিয়ে রশিদ upsert করে UsersData-তে planExpiresAt সেট করা হয়েছে।
+app.post("/VerifyPayment", async (req, res) => {
+  try {
+    const { sessionId, email } = req.body || {};
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status !== "paid") {
+      return res.status(400).json({
+        verified: false,
+        payment: false,
+        message: "Payment is not completed yet",
+      });
+    }
+
+    const meta = session.metadata || {};
+    const userEmail = String(
+      email || meta.email || session.customer_email || ""
+    ).toLowerCase();
+
+    if (!userEmail) {
+      return res.status(400).json({ error: "User email is missing" });
+    }
+
+    const userDoc = await UsersData.findOne({ email: userEmail });
+    const durationDays = Number(meta.durationDays) || 30;
+    const now = new Date();
+    const planExpiresAt = new Date(
+      now.getTime() + durationDays * 24 * 60 * 60 * 1000
+    );
+
+    const receipt = {
+      receiptId: `RCPT-${session.id.slice(-8).toUpperCase()}`,
+      sessionId: session.id,
+      email: userEmail,
+      name: meta.name || userDoc?.name || "",
+      image: meta.image || userDoc?.image || "",
+      role: meta.role || userDoc?.role || "student",
+      planKey: meta.planKey || "student_1m",
+      durationDays,
+      amountTotal: session.amount_total ? session.amount_total / 100 : 0,
+      currency: (session.currency || "usd").toUpperCase(),
+      payment: true,
+      status: "paid",
+      paidAt: now,
+      createdAt: now,
+      planExpiresAt,
+      returnTo: meta.returnTo || "/",
+    };
+
+    await StudentAndTeacherPaymentsStutus.updateOne(
+      { sessionId: session.id },
+      { $set: receipt },
+      { upsert: true }
+    );
+
+    await UsersData.updateOne(
+      { email: userEmail },
+      {
+        $set: {
+          activePlanKey: receipt.planKey,
+          planExpiresAt,
+          updatedAt: now,
+        },
+      }
+    );
+
+    return res.status(200).json({
+      verified: true,
+      payment: true,
+      isActivePlan: true,
+      receipt,
+      returnTo: receipt.returnTo,
+    });
+  } catch (err) {
+    console.error("POST /VerifyPayment error:", err);
+    return res.status(500).json({ error: "Payment verification failed" });
+  }
+});
+
+// হিন্ট: ইউজারের বর্তমান প্ল্যান active কি না ও কবে শেষ হবে তা জানানো হচ্ছে।
+// হিন্ট: ফ্রন্টএন্ডে active status ও expiry তারিখ দেখাতে।
+// হিন্ট: UsersData থেকে planExpiresAt পড়ে isPlanActive() দিয়ে যাচাই করা হয়েছে।
 app.get("/GetPlanStatus/:email", async (req, res) => {
-  const userEmail = String(req.params.email || "").toLowerCase();
-  const user = await UsersData.findOne({ email: userEmail });
-  const active = isPlanActive(user?.planExpiresAt);
+  try {
+    const userEmail = String(req.params.email || "").toLowerCase();
+    const user = await UsersData.findOne({ email: userEmail });
+    const active = isPlanActive(user?.planExpiresAt);
 
-  return res.status(200).json({
-    email: userEmail,
-    isActivePlan: active,
-    activePlanKey: active ? user?.activePlanKey || null : null,
-    planExpiresAt: user?.planExpiresAt || null,
-  });
+    return res.status(200).json({
+      email: userEmail,
+      isActivePlan: active,
+      activePlanKey: active ? user?.activePlanKey || null : null,
+      planExpiresAt: user?.planExpiresAt || null,
+    });
+  } catch (err) {
+    console.error("GET /GetPlanStatus error:", err);
+    return res.status(500).json({ error: "Failed to get plan status" });
+  }
 });
 
+// হিন্ট: নির্দিষ্ট ইউজারের paid রশিদগুলো নতুন থেকে পুরনো ক্রমে আনা হচ্ছে।
+// হিন্ট: Student ও Teacher প্রোফাইলে রশিদ কার্ড দেখাতে।
+// হিন্ট: email ও payment: true দিয়ে sort({ paidAt: -1 }) করে পাঠানো হয়েছে।
 app.get("/GetReceipts/:email", async (req, res) => {
-  const userEmail = String(req.params.email || "").toLowerCase();
-  const receipts = await StudentAndTeacherPaymentsStutus.find({
-    email: userEmail,
-    payment: true,
-  })
-    .sort({ paidAt: -1 })
-    .toArray();
+  try {
+    const userEmail = String(req.params.email || "").toLowerCase();
+    const receipts = await StudentAndTeacherPaymentsStutus.find({
+      email: userEmail,
+      payment: true,
+    })
+      .sort({ paidAt: -1 })
+      .toArray();
 
-  return res.status(200).json({ receipts });
+    return res.status(200).json({ receipts });
+  } catch (err) {
+    console.error("GET /GetReceipts error:", err);
+    return res.status(500).json({ error: "Failed to fetch receipts" });
+  }
 });
 
-// হিন্ট (কী): Admin Payment Page-এ সব পেমেন্ট রেকর্ড ও রশিদ দেখার route।
-// হিন্ট (কেন): অ্যাডমিন যেন সব পেমেন্ট প্রোফাইল ইমেজ ও রশিদসহ দেখতে পারে।
-// হিন্ট (কীভাবে): StudentAndTeacherPaymentsStutus থেকে সব ডকুমেন্ট sort করে ফেরত দেওয়া হচ্ছে।
+// হিন্ট: Admin Payment পেজের জন্য সব পেমেন্ট রেকর্ড আনা হচ্ছে।
+// হিন্ট: অ্যাডমিন যেন সব ইউজারের পেমেন্ট ও ছবি দেখতে পারে।
+// হিন্ট: StudentAndTeacherPaymentsStutus থেকে sort({ createdAt: -1 }) করে ফেরত দেওয়া হয়েছে।
 app.get("/AdminViewPayments", async (req, res) => {
-  const payments = await StudentAndTeacherPaymentsStutus.find({})
-    .sort({ createdAt: -1 })
-    .toArray();
+  try {
+    const payments = await StudentAndTeacherPaymentsStutus.find({})
+      .sort({ createdAt: -1 })
+      .toArray();
 
-  return res.status(200).json({ payments });
+    return res.status(200).json({ payments });
+  } catch (err) {
+    console.error("GET /AdminViewPayments error:", err);
+    return res.status(500).json({ error: "Failed to fetch payments" });
+  }
 });
 
-// Admin panel theke payment status update (frontend ei route call kore).
+// হিন্ট: Admin প্যানেল থেকে কোনো পেমেন্টের status paid/pending আপডেট করা হচ্ছে।
+// হিন্ট: অ্যাডমিন ম্যানুয়ালি পেমেন্ট স্ট্যাটাস পরিবর্তন করতে চাইলে।
+// হিন্ট: ObjectId যাচাই করে updateOne দিয়ে status ও payment আপডেট করা হয়েছে।
 app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1315,8 +1407,7 @@ app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
 
     const { status, payment } = req.body || {};
     const nextStatus = String(status || "").trim().toLowerCase();
-    const isPaid =
-      typeof payment === "boolean" ? payment : nextStatus === "paid";
+    const isPaid = typeof payment === "boolean" ? payment : nextStatus === "paid";
 
     const result = await StudentAndTeacherPaymentsStutus.updateOne(
       { _id: new ObjectId(id) },
@@ -1334,13 +1425,15 @@ app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
     }
 
     return res.status(200).json({ message: "Payment updated", result });
-  } catch (error) {
-    console.error("PATCH /UpdatePaymentStatus error:", error);
+  } catch (err) {
+    console.error("PATCH /UpdatePaymentStatus error:", err);
     return res.status(500).json({ message: "Failed to update payment" });
   }
 });
 
-// Admin panel theke payment record delete.
+// হিন্ট: Admin প্যানেল থেকে পেমেন্ট রেকর্ড মুছে ফেলা হচ্ছে।
+// হিন্ট: অপ্রয়োজনীয় বা ভুল রেকর্ড ডিলিট করার জন্য।
+// হিন্ট: ObjectId যাচাই করে deleteOne চালানো হয়েছে।
 app.delete("/DeletePayment/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1357,8 +1450,8 @@ app.delete("/DeletePayment/:id", async (req, res) => {
     }
 
     return res.status(200).json({ message: "Payment deleted", result });
-  } catch (error) {
-    console.error("DELETE /DeletePayment error:", error);
+  } catch (err) {
+    console.error("DELETE /DeletePayment error:", err);
     return res.status(500).json({ message: "Failed to delete payment" });
   }
 });
