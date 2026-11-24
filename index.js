@@ -1287,9 +1287,6 @@ app.get("/GetPlanStatus/:email", async (req, res) => {
   });
 });
 
-// হিন্ট (কী): ইউজারের নিজের সফল পেমেন্ট রশিদগুলো (Profile পেজে দেখানোর জন্য) আনার route।
-// হিন্ট (কেন): ইউজার যেন তার প্রোফাইল থেকে নিজের রশিদ দেখতে পারে।
-// হিন্ট (কীভাবে): payment: true ডকুমেন্টগুলো নতুন থেকে পুরনো ক্রমে find করে ফেরত দেওয়া হচ্ছে।
 app.get("/GetReceipts/:email", async (req, res) => {
   const userEmail = String(req.params.email || "").toLowerCase();
   const receipts = await StudentAndTeacherPaymentsStutus.find({
