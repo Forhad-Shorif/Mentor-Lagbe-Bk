@@ -1,18 +1,45 @@
 import { MongoClient, ObjectId } from 'mongodb';
-import cors from 'cors'
+import cors from 'cors';
 import express from 'express';
 import dotenv from 'dotenv/config';
+import Stripe from 'stripe';
 
-import dns from "node:dns";
-dns.setServers(["8.8.8.8", "8.8.4.4"]);
+import dns from 'node:dns';
+dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 const app = express();
-const escapeSearchRegex = (value = "") => {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const escapeSearchRegex = (value = '') => {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
+
+// Search term + extra filter mile ekta valid Mongo query banay.
+// Ei helper chara /ApplyGet, /TeacherApplicationsGet crash korto.
+function buildSearchQuery(search, fields = [], extraFilters = {}) {
+  const term = String(search || '').trim();
+  const base =
+    extraFilters && typeof extraFilters === 'object' ? { ...extraFilters } : {};
+
+  if (!term) return base;
+
+  const safe = escapeSearchRegex(term);
+  const or = (Array.isArray(fields) ? fields : [])
+    .filter(Boolean)
+    .map((field) => ({ [field]: new RegExp(safe, 'i') }));
+
+  if (or.length === 0) return base;
+  if (Object.keys(base).length === 0) return { $or: or };
+
+  return { $and: [base, { $or: or }] };
+}
 
 app.use(cors());
 app.use(express.json());
+
+// হিন্ট (কী): Stripe SDK থেকে stripe instance তৈরি করা হচ্ছে।
+// হিন্ট (কেন): সার্ভার থেকে পেমেন্ট সেশন যাচাই করার জন্য stripe অবজেক্ট দরকার (Stripe উপরে import করা আছে)।
+// হিন্ট (কীভাবে): STRIPE_SECRET_KEY দিয়ে নতুন Stripe instance বানানো হয়েছে।
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 
 const PORT = process.env.PORT || 8000;
 
@@ -30,6 +57,8 @@ export async function connectToMongoDB() {
 
 const MongoDB = await connectToMongoDB();
 const db = MongoDB.db("assignment-projects");
+const Reviw = db.collection('')
+const Massage = db.collection('')
 const UsersData = db.collection("user")
 const UserProfiles = db.collection("Profile");
 const TeachersAddress = db.collection("Teacher-Address")
@@ -37,6 +66,8 @@ const tuitionsCollection = db.collection("Tuitions")
 const applicationsCollection = db.collection("Applications")
 const StudentsSavedApplications = db.collection("Saved")
 const TeacherAndAdminBioCullection = db.collection("Bio")
+const StudentAndTeacherPaymentsStutus = db.collection("payments")
+
 
 //==============================================
 //User Requst to Admin
@@ -1063,6 +1094,283 @@ app.delete("/SavedTuitionsDelete/:id", async (req, res) => {
     return res.status(500).send({ message: "Failed to delete saved tuition" });
   }
 });
+
+//===========================================
+//Post and Apply tutions Count
+//==========================================
+const FREE_LIMIT = 2;
+
+function hasActivePlan(user) {
+  if (!user?.planExpiresAt) return false;
+  return new Date(user.planExpiresAt).getTime() > Date.now();
+}
+
+// আপনার চেনা app.get স্টাইলেই Teacher-এর Post Count
+app.get("/GetPostCount/:email", async (req, res) => {
+  try {
+    const email = req.params.email;
+    const user = await UsersData.findOne({ email });
+    const activePlan = hasActivePlan(user);
+
+    const postCount = await tuitionsCollection.countDocuments({
+      $or: [{ teacherEmail: email }, { email }, { Email: email }],
+    });
+
+    return res.send({
+      postCount,
+      hasActivePlan: activePlan,
+      canPostMore: activePlan || postCount < FREE_LIMIT,
+    });
+  } catch (err) {
+    res.status(500).send({ message: "Error getting post count" });
+  }
+});
+
+// আপনার চেনা app.get স্টাইলেই Student-এর Apply Count
+app.get("/GetApplyCount/:email", async (req, res) => {
+  try {
+    const email = req.params.email;
+    const user = await UsersData.findOne({ email });
+    const activePlan = hasActivePlan(user);
+
+    const applyCount = await applicationsCollection.countDocuments({
+      studentEmail: email,
+    });
+
+    return res.send({
+      applyCount,
+      hasActivePlan: activePlan,
+      canApplyMore: activePlan || applyCount < FREE_LIMIT,
+    });
+  } catch (err) {
+    res.status(500).send({ message: "Error getting apply count" });
+  }
+});
+
+//=============================================================
+//STRIPE AR SESSION AND CHEKING AND ROSID SAVE TO BACKEND
+//========================================================
+// হিন্ট (কী): বর্তমান সময় অনুযায়ী ইউজারের প্ল্যান সক্রিয় (active) কি না তা হিসাব করার helper।
+// হিন্ট (কেন): মেয়াদ শেষ (planExpiresAt < now) হলে যেন সিস্টেম সাথে সাথে প্ল্যানকে inactive ধরে এবং রশিদ না বদলায়।
+// হিন্ট (কীভাবে): planExpiresAt তারিখ থাকলে বর্তমান সময়ের (Date.now()) সাথে তুলনা করে true/false ফেরত দেয়।
+function isPlanActive(planExpiresAt) {
+  if (!planExpiresAt) return false;
+  return new Date(planExpiresAt).getTime() > Date.now();
+}
+
+// হিন্ট (কী): Checkout শুরু হলে payment: false দিয়ে pending রেকর্ড সেভ করার route।
+// হিন্ট (কেন): ইউজার Stripe পেজে গিয়ে পেমেন্ট না করে ব্যাক করলে রেকর্ডটি payment: false-ই থেকে যায়।
+// হিন্ট (কীভাবে): StudentAndTeacherPaymentsStutus কালেকশনে payment: false দিয়ে insertOne করা হচ্ছে।
+app.post("/PaymentPending", async (req, res) => {
+  const { email, name, image, role, planKey, durationDays, returnTo } =
+    req.body;
+
+  if (!email || !planKey) {
+    return res.status(400).json({ error: "email and planKey are required" });
+  }
+
+  const result = await StudentAndTeacherPaymentsStutus.insertOne({
+    email: String(email).toLowerCase(),
+    name: name || "",
+    image: image || "",
+    role: role || "student",
+    planKey,
+    durationDays: Number(durationDays) || 30,
+    payment: false,
+    status: "pending",
+    returnTo: returnTo || "/",
+    createdAt: new Date(),
+  });
+
+  return res.status(201).json({
+    insertedId: result.insertedId,
+    payment: false,
+  });
+});
+
+// হিন্ট (কী): Stripe থেকে পেমেন্ট সত্যিই হয়েছে কি না যাচাই করে payment: true, মেয়াদ ও রশিদ সেভ করার route।
+// হিন্ট (কেন): টাকা পরিশোধ হলেই কেবল payment: true হবে, ৩০ বা ৯০ দিনের মেয়াদ বসবে এবং রশিদ তৈরি হবে।
+// হিন্ট (কীভাবে): sessionId দিয়ে Stripe চেক করে paid হলে payments ও user কালেকশন আপডেট করা হচ্ছে।
+app.post("/VerifyPayment", async (req, res) => {
+  const { sessionId, email } = req.body;
+
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId is required" });
+  }
+
+  const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+  if (session.payment_status !== "paid") {
+    return res.status(400).json({
+      verified: false,
+      payment: false,
+      message: "Payment is not completed yet",
+    });
+  }
+
+  const meta = session.metadata || {};
+  const userEmail = String(
+    email || meta.email || session.customer_email || ""
+  ).toLowerCase();
+
+  if (!userEmail) {
+    return res.status(400).json({ error: "User email is missing" });
+  }
+
+  const durationDays = Number(meta.durationDays) || 30;
+  const now = new Date();
+  const planExpiresAt = new Date(
+    now.getTime() + durationDays * 24 * 60 * 60 * 1000
+  );
+
+  const userDoc = await UsersData.findOne({ email: userEmail });
+  const userName = meta.name || userDoc?.name || "";
+  const userImage = meta.image || userDoc?.image || "";
+
+  const receipt = {
+    receiptId: `RCPT-${session.id.slice(-8).toUpperCase()}`,
+    sessionId: session.id,
+    email: userEmail,
+    name: userName,
+    image: userImage,
+    role: meta.role || userDoc?.role || "student",
+    planKey: meta.planKey || "student_1m",
+    durationDays,
+    amountTotal: session.amount_total ? session.amount_total / 100 : 0,
+    currency: (session.currency || "usd").toUpperCase(),
+    payment: true,
+    status: "paid",
+    paidAt: now,
+    planExpiresAt,
+    returnTo: meta.returnTo || "/",
+  };
+
+  await StudentAndTeacherPaymentsStutus.updateOne(
+    { email: userEmail, payment: false, status: "pending" },
+    { $set: receipt },
+    { upsert: true }
+  );
+
+  await UsersData.updateOne(
+    { email: userEmail },
+    {
+      $set: {
+        activePlanKey: receipt.planKey,
+        planExpiresAt,
+        updatedAt: now,
+      },
+    }
+  );
+
+  return res.status(200).json({
+    verified: true,
+    payment: true,
+    isActivePlan: true,
+    receipt,
+    returnTo: receipt.returnTo,
+  });
+});
+
+// হিন্ট (কী): ইউজারের বর্তমান প্ল্যান active কি না এবং কবে শেষ হবে তা জানানোর route।
+// হিন্ট (কেন): মেয়াদ শেষ হলে ব্যাকএন্ড থেকে inactive দেখাতে (পুরনো রশিদ payment: true রেখেই)।
+// হিন্ট (কীভাবে): UsersData থেকে planExpiresAt পড়ে isPlanActive() দিয়ে চেক করা হচ্ছে।
+app.get("/GetPlanStatus/:email", async (req, res) => {
+  const userEmail = String(req.params.email || "").toLowerCase();
+  const user = await UsersData.findOne({ email: userEmail });
+  const active = isPlanActive(user?.planExpiresAt);
+
+  return res.status(200).json({
+    email: userEmail,
+    isActivePlan: active,
+    activePlanKey: active ? user?.activePlanKey || null : null,
+    planExpiresAt: user?.planExpiresAt || null,
+  });
+});
+
+// হিন্ট (কী): ইউজারের নিজের সফল পেমেন্ট রশিদগুলো (Profile পেজে দেখানোর জন্য) আনার route।
+// হিন্ট (কেন): ইউজার যেন তার প্রোফাইল থেকে নিজের রশিদ দেখতে পারে।
+// হিন্ট (কীভাবে): payment: true ডকুমেন্টগুলো নতুন থেকে পুরনো ক্রমে find করে ফেরত দেওয়া হচ্ছে।
+app.get("/GetReceipts/:email", async (req, res) => {
+  const userEmail = String(req.params.email || "").toLowerCase();
+  const receipts = await StudentAndTeacherPaymentsStutus.find({
+    email: userEmail,
+    payment: true,
+  })
+    .sort({ paidAt: -1 })
+    .toArray();
+
+  return res.status(200).json({ receipts });
+});
+
+// হিন্ট (কী): Admin Payment Page-এ সব পেমেন্ট রেকর্ড ও রশিদ দেখার route।
+// হিন্ট (কেন): অ্যাডমিন যেন সব পেমেন্ট প্রোফাইল ইমেজ ও রশিদসহ দেখতে পারে।
+// হিন্ট (কীভাবে): StudentAndTeacherPaymentsStutus থেকে সব ডকুমেন্ট sort করে ফেরত দেওয়া হচ্ছে।
+app.get("/AdminViewPayments", async (req, res) => {
+  const payments = await StudentAndTeacherPaymentsStutus.find({})
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  return res.status(200).json({ payments });
+});
+
+// Admin panel theke payment status update (frontend ei route call kore).
+app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid payment id" });
+    }
+
+    const { status, payment } = req.body || {};
+    const nextStatus = String(status || "").trim().toLowerCase();
+    const isPaid =
+      typeof payment === "boolean" ? payment : nextStatus === "paid";
+
+    const result = await StudentAndTeacherPaymentsStutus.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status: nextStatus || (isPaid ? "paid" : "pending"),
+          payment: isPaid,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "Payment not found" });
+    }
+
+    return res.status(200).json({ message: "Payment updated", result });
+  } catch (error) {
+    console.error("PATCH /UpdatePaymentStatus error:", error);
+    return res.status(500).json({ message: "Failed to update payment" });
+  }
+});
+
+// Admin panel theke payment record delete.
+app.delete("/DeletePayment/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid payment id" });
+    }
+
+    const result = await StudentAndTeacherPaymentsStutus.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Payment not found" });
+    }
+
+    return res.status(200).json({ message: "Payment deleted", result });
+  } catch (error) {
+    console.error("DELETE /DeletePayment error:", error);
+    return res.status(500).json({ message: "Failed to delete payment" });
+  }
+});
+
 //==================================
 // Admin and Tutions bio Option
 // ================================
@@ -1138,7 +1446,7 @@ app.get("/GetBio", async (req, res) => {
       return res.status(400).send({ message: "Invalid id or email" });
     }
 
-    const doc = await bioCollection.findOne(filter);
+    const doc = await TeacherAndAdminBioCullection.findOne(filter);
 
     return res.status(200).send({
       bio: doc?.bio || "",
