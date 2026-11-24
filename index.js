@@ -12,8 +12,6 @@ const escapeSearchRegex = (value = '') => {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
 
-// Search term + extra filter mile ekta valid Mongo query banay.
-// Ei helper chara /ApplyGet, /TeacherApplicationsGet crash korto.
 function buildSearchQuery(search, fields = [], extraFilters = {}) {
   const term = String(search || '').trim();
   const base =
@@ -35,9 +33,6 @@ function buildSearchQuery(search, fields = [], extraFilters = {}) {
 app.use(cors());
 app.use(express.json());
 
-// হিন্ট (কী): Stripe SDK থেকে stripe instance তৈরি করা হচ্ছে।
-// হিন্ট (কেন): সার্ভার থেকে পেমেন্ট সেশন যাচাই করার জন্য stripe অবজেক্ট দরকার (Stripe উপরে import করা আছে)।
-// হিন্ট (কীভাবে): STRIPE_SECRET_KEY দিয়ে নতুন Stripe instance বানানো হয়েছে।
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 
@@ -690,7 +685,7 @@ app.delete("/TuitionsDelete/:id", async (req, res) => {
 // --- APPLICATIONS ROUTES ---
 //======================================================
 // Apply Now (student -> tuition)
-//======================================================
+//=====================================================
 
 // POST: Student Apply Post tuitions
 app.post("/ApplyPost", async (req, res) => {
