@@ -52,10 +52,12 @@ export async function connectToMongoDB() {
 
 const MongoDB = await connectToMongoDB();
 const db = MongoDB.db("assignment-projects");
-const Reviw = db.collection('')
-const Massage = db.collection('')
+// const Reviw = db.collection('Reviw')
+// const Report = db.collection('Report')
+// const Massage = db.collection('Massage')
 const UsersData = db.collection("user")
 const UserProfiles = db.collection("Profile");
+// const Notifications = db.collection('Notifications')
 const TeachersAddress = db.collection("Teacher-Address")
 const tuitionsCollection = db.collection("Tuitions")
 const applicationsCollection = db.collection("Applications")
@@ -1188,17 +1190,18 @@ async function syncUserPlanFromReceipts(rawEmail) {
     .toArray();
 
   const now = Date.now();
-  const latest = paidReceipts
-    .filter(
-      (receipt) =>
-        receipt?.planExpiresAt &&
-        new Date(receipt.planExpiresAt).getTime() > now
-    )
-    .sort(
-      (a, b) =>
-        new Date(b.planExpiresAt).getTime() -
-        new Date(a.planExpiresAt).getTime()
-    )[0] || null;
+  const latest =
+    paidReceipts
+      .filter(
+        (receipt) =>
+          receipt?.planExpiresAt &&
+          new Date(receipt.planExpiresAt).getTime() > now
+      )
+      .sort(
+        (a, b) =>
+          new Date(b.planExpiresAt).getTime() -
+          new Date(a.planExpiresAt).getTime()
+      )[0] || null;
 
   const planExpiresAt = latest ? new Date(latest.planExpiresAt) : null;
   const activePlanKey = latest ? latest.planKey || null : null;
@@ -1218,13 +1221,11 @@ async function syncUserPlanFromReceipts(rawEmail) {
 // হিন্ট: Stripe redirect-এর জন্য অ্যাপের base URL পরিষ্কারভাবে নেওয়া হচ্ছে।
 // হিন্ট: শেষে extra slash থাকলে ভুল URL তৈরি হতে পারে।
 // হিন্ট: .replace(/\/+$/, "") দিয়ে শেষের slash কাটা হয়েছে।
-const APP_URL = (
-  process.env.NEXT_PUBLIC_APP_URL 
-).replace(/\/+$/, "");
+const APP_URL = (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/+$/, "");
 
 // হিন্ট: নির্বাচিত প্ল্যানের জন্য Stripe Checkout Session তৈরি করা হচ্ছে।
-// হিন্ট: ইউজারকে Stripe-এর payment card পেজে পাঠানোর জন্য session.url দরকার।
-// হিন্ট: stripe.checkout.sessions.create() কল করে metadata-সহ URL ফেরত দেওয়া হয়েছে।
+// হিন্ট: active paid প্ল্যান থাকলে Stripe-এ যেতে দেওয়া হবে না; মেয়াদ শেষ হলে আবার যেতে পারবে।
+// হিন্ট: আগে syncUserPlanFromReceipts দিয়ে active plan চেক করে session তৈরি করা হয়েছে।
 app.post("/CreateCheckoutSession", async (req, res) => {
   try {
     const {
@@ -1246,7 +1247,16 @@ app.post("/CreateCheckoutSession", async (req, res) => {
         .json({ error: "email, planKey, and amount are required" });
     }
 
-    const cleanEmail = String(email).toLowerCase();
+    const cleanEmail = String(email).trim().toLowerCase();
+    const currentPlan = await syncUserPlanFromReceipts(cleanEmail);
+
+    if (currentPlan.isActivePlan) {
+      return res.status(403).json({
+        error: "You already have an active plan until expiration",
+        planExpiresAt: currentPlan.planExpiresAt,
+      });
+    }
+
     const days = Number(durationDays) || 30;
 
     const session = await stripe.checkout.sessions.create({
@@ -1282,34 +1292,71 @@ app.post("/CreateCheckoutSession", async (req, res) => {
   }
 });
 
-// হিন্ট: Checkout শুরু হলে payment: false দিয়ে pending রেকর্ড সেভ করা হচ্ছে।
-// হিন্ট: পেমেন্ট না করে ব্যাক করলে রেকর্ডটি pending অবস্থায় থেকে যায়।
-// হিন্ট: StudentAndTeacherPaymentsStutus কালেকশনে insertOne করা হয়েছে।
+// হিন্ট: প্রথমবার ১টি pending রেকর্ড সেভ হবে; পরে পেমেন্ট না করে ফিরলে ওই একই pending আপডেট হবে।
+// হিন্ট: বারবার ফিরে এলে যেন ডাটাবেসে একাধিক pending না জমে এবং active plan থাকলে নতুন pending না হয়।
+// হিন্ট: payment: false, status: "pending" ফিল্টারে upsert: true দিয়ে updateOne করা হয়েছে।
 app.post("/PaymentPending", async (req, res) => {
   try {
-    const { email, name, image, role, planKey, durationDays, returnTo } =
-      req.body || {};
+    const {
+      email,
+      name,
+      image,
+      role,
+      planKey,
+      amount,
+      currency = "usd",
+      durationDays,
+      returnTo,
+    } = req.body || {};
 
     if (!email || !planKey) {
       return res.status(400).json({ error: "email and planKey are required" });
     }
 
-    const result = await StudentAndTeacherPaymentsStutus.insertOne({
-      email: String(email).toLowerCase(),
+    const cleanEmail = String(email).trim().toLowerCase();
+    const currentPlan = await syncUserPlanFromReceipts(cleanEmail);
+
+    if (currentPlan.isActivePlan) {
+      return res.status(200).json({
+        skipped: true,
+        payment: true,
+        message: "Active plan already exists",
+      });
+    }
+
+    const now = new Date();
+    const pendingDoc = {
+      email: cleanEmail,
       name: name || "",
       image: image || "",
       role: role || "student",
       planKey,
+      amountTotal: Number(amount) || 0,
+      currency: String(currency || "usd").toUpperCase(),
       durationDays: Number(durationDays) || 30,
       payment: false,
       status: "pending",
       returnTo: returnTo || "/",
-      createdAt: new Date(),
-    });
+      updatedAt: now,
+    };
 
-    return res.status(201).json({
-      insertedId: result.insertedId,
+    const result = await StudentAndTeacherPaymentsStutus.updateOne(
+      {
+        email: cleanEmail,
+        payment: false,
+        status: "pending",
+      },
+      {
+        $set: pendingDoc,
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true }
+    );
+
+    return res.status(200).json({
+      upsertedId: result.upsertedId || null,
       payment: false,
+      status: "pending",
     });
   } catch (err) {
     console.error("POST /PaymentPending error:", err);
@@ -1317,9 +1364,9 @@ app.post("/PaymentPending", async (req, res) => {
   }
 });
 
-// হিন্ট: Stripe পেমেন্ট যাচাই করে রশিদ সেভ ও ইউজারের প্ল্যান মেয়াদ আপডেট করা হচ্ছে।
-// হিন্ট: পেমেন্ট সফল হলেই কেবল রশিদ তৈরি হবে এবং মেয়াদ বাড়বে।
-// হিন্ট: session.id দিয়ে রশিদ upsert করে UsersData-তে planExpiresAt সেট করা হয়েছে।
+// হিন্ট: Stripe পেমেন্ট যাচাই করে বিদ্যমান pending রেকর্ডকেই paid হিসেবে আপডেট করা হচ্ছে।
+// হিন্ট: পেমেন্ট সফল হলে আলাদা রেকর্ড না জমিয়ে আগের pending-টাই আপডেট হয়ে paid হবে।
+// হিন্ট: আগে pending রেকর্ড খুঁজে সেটিই paid করা হয়েছে, না পেলে sessionId দিয়ে upsert করা হয়েছে।
 app.post("/VerifyPayment", async (req, res) => {
   try {
     const { sessionId, email } = req.body || {};
@@ -1339,7 +1386,9 @@ app.post("/VerifyPayment", async (req, res) => {
     const meta = session.metadata || {};
     const userEmail = String(
       email || meta.email || session.customer_email || ""
-    ).toLowerCase();
+    )
+      .trim()
+      .toLowerCase();
 
     if (!userEmail) {
       return res.status(400).json({ error: "User email is missing" });
@@ -1352,7 +1401,7 @@ app.post("/VerifyPayment", async (req, res) => {
       now.getTime() + durationDays * 24 * 60 * 60 * 1000
     );
 
-    const receipt = {
+    const paidFields = {
       receiptId: `RCPT-${session.id.slice(-8).toUpperCase()}`,
       sessionId: session.id,
       email: userEmail,
@@ -1366,16 +1415,39 @@ app.post("/VerifyPayment", async (req, res) => {
       payment: true,
       status: "paid",
       paidAt: now,
-      createdAt: now,
+      updatedAt: now,
       planExpiresAt,
       returnTo: meta.returnTo || "/",
     };
 
-    await StudentAndTeacherPaymentsStutus.updateOne(
-      { sessionId: session.id },
-      { $set: receipt },
-      { upsert: true }
+    // হিন্ট: আগের pending রেকর্ড খোঁজা হচ্ছে — status ফিল্ডের বানান/কেস যাই হোক,
+    // payment !== true হলেই সেটাকে pending ধরা হচ্ছে, যাতে একই পেমেন্টের জন্য
+    // ডুপ্লিকেট paid রশিদ তৈরি না হয় (পুরনো রেকর্ডে status ভিন্ন হলে আগে নতুন
+    // ডকুমেন্ট তৈরি হয়ে যেত)।
+    const existingPending = await StudentAndTeacherPaymentsStutus.findOne(
+      { email: userEmail, payment: { $ne: true } },
+      { sort: { updatedAt: -1, createdAt: -1 } }
     );
+
+    if (existingPending) {
+      await StudentAndTeacherPaymentsStutus.updateOne(
+        { _id: existingPending._id },
+        { $set: paidFields }
+      );
+    } else {
+      await StudentAndTeacherPaymentsStutus.updateOne(
+        { sessionId: session.id },
+        {
+          $set: paidFields,
+          $setOnInsert: { createdAt: now },
+        },
+        { upsert: true }
+      );
+    }
+
+    const receipt = existingPending
+      ? { ...existingPending, ...paidFields }
+      : { createdAt: now, ...paidFields };
 
     // হিন্ট: রশিদ সেভ হওয়ার পর paid রশিদ থেকেই UsersData-র প্ল্যান মেয়াদ হিসাব করা হচ্ছে।
     // হিন্ট: ফলে পেমেন্ট ডিলিট/রিভার্স হলেও ইউজার ভুলভাবে Pro থাকবে না।
@@ -1416,17 +1488,17 @@ app.get("/GetPlanStatus/:email", async (req, res) => {
   }
 });
 
-// হিন্ট: নির্দিষ্ট ইউজারের paid রশিদগুলো নতুন থেকে পুরনো ক্রমে আনা হচ্ছে।
+// হিন্ট: নির্দিষ্ট ইউজারের paid ও pending রশিদগুলো নতুন থেকে পুরনো ক্রমে আনা হচ্ছে।
 // হিন্ট: Student ও Teacher প্রোফাইলে রশিদ কার্ড দেখাতে।
-// হিন্ট: email ও payment: true দিয়ে sort({ paidAt: -1 }) করে পাঠানো হয়েছে।
+// হিন্ট: email অনুযায়ী রশিদ এনে sort({ paidAt: -1, updatedAt: -1 }) করে পাঠানো হয়েছে।
 app.get("/GetReceipts/:email", async (req, res) => {
   try {
-    const userEmail = String(req.params.email || "").toLowerCase();
+    const userEmail = String(req.params.email || "").trim().toLowerCase();
     const receipts = await StudentAndTeacherPaymentsStutus.find({
       email: userEmail,
-      payment: true,
+      $or: [{ payment: true }, { status: "pending" }],
     })
-      .sort({ paidAt: -1 })
+      .sort({ paidAt: -1, updatedAt: -1, createdAt: -1 })
       .toArray();
 
     return res.status(200).json({ receipts });
@@ -1471,7 +1543,8 @@ app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
 
     const { status, payment } = req.body || {};
     const nextStatus = String(status || "").trim().toLowerCase();
-    const isPaid = typeof payment === "boolean" ? payment : nextStatus === "paid";
+    const isPaid =
+      typeof payment === "boolean" ? payment : nextStatus === "paid";
 
     // হিন্ট: অ্যাডমিন paid করলে রশিদে মেয়াদ না থাকলে সেটিও তৈরি করা হচ্ছে।
     // হিন্ট: pending/refund হলে planExpiresAt null হয়ে ইউজারের প্ল্যান বন্ধ হবে।
