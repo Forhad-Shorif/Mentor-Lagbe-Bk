@@ -706,7 +706,7 @@ app.post("/ApplyPost", async (req, res) => {
     const [user, tuition, alreadyApplied] = await Promise.all([
       UsersData.findOne(
         { email: studentEmail },
-        { projection: { payment: 1 } }
+        { projection: { payment: 1, planExpiresAt: 1, activePlanKey: 1 } }
       ),
       tuitionsCollection.findOne({ _id: new ObjectId(tuitionId) }),
       applicationsCollection.findOne(
@@ -729,14 +729,19 @@ app.post("/ApplyPost", async (req, res) => {
         .send({ message: "You have already applied for this tuition" });
     }
 
-    const isPro = Boolean(user?.payment);
+    // হিন্ট: Pro কি না তা এখন paid রশিদ/planExpiresAt থেকে ঠিক করা হচ্ছে।
+    // আগে শুধু UsersData.payment ফ্ল্যাগ দেখা হতো, যা Stripe পেমেন্টের পর true হতো না —
+    // তাই প্ল্যান কেনার পরেও ২টি Apply শেষ হলে ইউজার আবার Pricing পেজে চলে যেত।
+    const planStatus = await syncUserPlanFromReceipts(studentEmail);
+    const isPro = planStatus.isActivePlan || Boolean(user?.payment);
+
     if (!isPro) {
       const appliedCount = await applicationsCollection.countDocuments({
         studentEmail,
         post: { $ne: false },
       });
 
-      if (appliedCount >= 2) {
+      if (appliedCount >= FREE_LIMIT) {
         return res.status(403).send({
           limitReached: true,
           message:
@@ -967,8 +972,11 @@ app.post("/SavedTuitions", async (req, res) => {
     }
 
     // Pro না হলে সর্বোচ্চ 2টা bookmark লিমিট চেক
+    // হিন্ট: Pro status রশিদ/planExpiresAt থেকে নেওয়া হচ্ছে (আগে শুধু payment ফ্ল্যাগ
+    // দেখত, যা Stripe পেমেন্টের পর true হতো না — তাই পেমেন্ট করেও 2টার বেশি save করা যেত না)।
     const user = await UsersData.findOne({ email: studentEmail });
-    const isPro = Boolean(user?.payment);
+    const planStatus = await syncUserPlanFromReceipts(studentEmail);
+    const isPro = planStatus.isActivePlan || Boolean(user?.payment);
 
     if (!isPro) {
       const count = await StudentsSavedApplications.countDocuments({
@@ -1103,18 +1111,23 @@ function hasActivePlan(user) {
 // আপনার চেনা app.get স্টাইলেই Teacher-এর Post Count
 app.get("/GetPostCount/:email", async (req, res) => {
   try {
-    const email = req.params.email;
-    const user = await UsersData.findOne({ email });
-    const activePlan = hasActivePlan(user);
+    const email = decodeURIComponent(req.params.email || "").trim();
+    const emailRegex = new RegExp(`^${escapeSearchRegex(email)}$`, "i");
+
+    // হিন্ট: planExpiresAt stale থাকতে পারে, তাই রশিদ থেকে সত্যিকারের স্ট্যাটাস নেওয়া হচ্ছে।
+    const planStatus = await syncUserPlanFromReceipts(email);
+    const user = await UsersData.findOne({ email: emailRegex });
+    const activePlan = planStatus.isActivePlan || hasActivePlan(user);
 
     const postCount = await tuitionsCollection.countDocuments({
-      $or: [{ teacherEmail: email }, { email }, { Email: email }],
+      $or: [{ teacherEmail: emailRegex }, { email: emailRegex }, { Email: emailRegex }],
     });
 
     return res.send({
       postCount,
       hasActivePlan: activePlan,
       canPostMore: activePlan || postCount < FREE_LIMIT,
+      freeLimit: FREE_LIMIT,
     });
   } catch (err) {
     res.status(500).send({ message: "Error getting post count" });
@@ -1124,18 +1137,25 @@ app.get("/GetPostCount/:email", async (req, res) => {
 // আপনার চেনা app.get স্টাইলেই Student-এর Apply Count
 app.get("/GetApplyCount/:email", async (req, res) => {
   try {
-    const email = req.params.email;
-    const user = await UsersData.findOne({ email });
-    const activePlan = hasActivePlan(user);
+    const email = decodeURIComponent(req.params.email || "").trim();
+    const emailLower = email.toLowerCase();
+    const emailRegex = new RegExp(`^${escapeSearchRegex(email)}$`, "i");
+
+    // হিন্ট: এখানেও রশিদ-ভিত্তিক প্ল্যান স্ট্যাটাস ব্যবহার করা হচ্ছে, যাতে
+    // "GetApplyCount বলে apply করতে পারবে" কিন্তু ApplyPost আটকে দেয় — এমন বিরোধ না থাকে।
+    const planStatus = await syncUserPlanFromReceipts(emailLower);
+    const user = await UsersData.findOne({ email: emailRegex });
+    const activePlan = planStatus.isActivePlan || hasActivePlan(user);
 
     const applyCount = await applicationsCollection.countDocuments({
-      studentEmail: email,
+      studentEmail: emailRegex,
     });
 
     return res.send({
       applyCount,
       hasActivePlan: activePlan,
       canApplyMore: activePlan || applyCount < FREE_LIMIT,
+      freeLimit: FREE_LIMIT,
     });
   } catch (err) {
     res.status(500).send({ message: "Error getting apply count" });
@@ -1150,6 +1170,49 @@ app.get("/GetApplyCount/:email", async (req, res) => {
 // হিন্ট: planExpiresAt-এর সাথে Date.now() তুলনা করা হয়েছে।
 function isPlanActive(planExpiresAt) {
   return Boolean(planExpiresAt) && new Date(planExpiresAt).getTime() > Date.now();
+}
+
+// হিন্ট: প্ল্যান active কি না তার একমাত্র সত্য উৎস হলো paid রশিদ (payments কালেকশন)।
+// হিন্ট: payment রেকর্ড ডিলিট/রিভার্স হলে UsersData-তে রয়ে যাওয়া পুরনো planExpiresAt
+//        ইউজারকে চিরতরে "Pro" বানিয়ে রাখত — তাই সেই stale ডেটা এখানে পরিষ্কার করা হচ্ছে।
+// হিন্ট: সব paid রশিদের মধ্যে সবচেয়ে বড় ভবিষ্যৎ planExpiresAt ধরে UsersData আপডেট করা হয়েছে।
+async function syncUserPlanFromReceipts(rawEmail) {
+  const userEmail = String(rawEmail || "").trim().toLowerCase();
+
+  if (!userEmail) {
+    return { isActivePlan: false, activePlanKey: null, planExpiresAt: null };
+  }
+
+  const paidReceipts = await StudentAndTeacherPaymentsStutus
+    .find({ email: userEmail, payment: true })
+    .toArray();
+
+  const now = Date.now();
+  const latest = paidReceipts
+    .filter(
+      (receipt) =>
+        receipt?.planExpiresAt &&
+        new Date(receipt.planExpiresAt).getTime() > now
+    )
+    .sort(
+      (a, b) =>
+        new Date(b.planExpiresAt).getTime() -
+        new Date(a.planExpiresAt).getTime()
+    )[0] || null;
+
+  const planExpiresAt = latest ? new Date(latest.planExpiresAt) : null;
+  const activePlanKey = latest ? latest.planKey || null : null;
+
+  await UsersData.updateOne(
+    { email: userEmail },
+    { $set: { activePlanKey, planExpiresAt, updatedAt: new Date() } }
+  );
+
+  return {
+    isActivePlan: Boolean(latest),
+    activePlanKey,
+    planExpiresAt,
+  };
 }
 
 // হিন্ট: Stripe redirect-এর জন্য অ্যাপের base URL পরিষ্কারভাবে নেওয়া হচ্ছে।
@@ -1314,16 +1377,9 @@ app.post("/VerifyPayment", async (req, res) => {
       { upsert: true }
     );
 
-    await UsersData.updateOne(
-      { email: userEmail },
-      {
-        $set: {
-          activePlanKey: receipt.planKey,
-          planExpiresAt,
-          updatedAt: now,
-        },
-      }
-    );
+    // হিন্ট: রশিদ সেভ হওয়ার পর paid রশিদ থেকেই UsersData-র প্ল্যান মেয়াদ হিসাব করা হচ্ছে।
+    // হিন্ট: ফলে পেমেন্ট ডিলিট/রিভার্স হলেও ইউজার ভুলভাবে Pro থাকবে না।
+    await syncUserPlanFromReceipts(userEmail);
 
     return res.status(200).json({
       verified: true,
@@ -1340,18 +1396,19 @@ app.post("/VerifyPayment", async (req, res) => {
 
 // হিন্ট: ইউজারের বর্তমান প্ল্যান active কি না ও কবে শেষ হবে তা জানানো হচ্ছে।
 // হিন্ট: ফ্রন্টএন্ডে active status ও expiry তারিখ দেখাতে।
-// হিন্ট: UsersData থেকে planExpiresAt পড়ে isPlanActive() দিয়ে যাচাই করা হয়েছে।
+// হিন্ট: paid রশিদ থেকে মেয়াদ হিসাব করা হয়, তাই ডিলিট হওয়া পেমেন্ট আর
+//        "Pro active" দেখাবে না (guard: syncUserPlanFromReceipts)।
 app.get("/GetPlanStatus/:email", async (req, res) => {
   try {
-    const userEmail = String(req.params.email || "").toLowerCase();
-    const user = await UsersData.findOne({ email: userEmail });
-    const active = isPlanActive(user?.planExpiresAt);
+    const userEmail = String(req.params.email || "").trim().toLowerCase();
+    const { isActivePlan, activePlanKey, planExpiresAt } =
+      await syncUserPlanFromReceipts(userEmail);
 
     return res.status(200).json({
       email: userEmail,
-      isActivePlan: active,
-      activePlanKey: active ? user?.activePlanKey || null : null,
-      planExpiresAt: user?.planExpiresAt || null,
+      isActivePlan,
+      activePlanKey,
+      planExpiresAt,
     });
   } catch (err) {
     console.error("GET /GetPlanStatus error:", err);
@@ -1405,9 +1462,28 @@ app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
       return res.status(400).json({ message: "Invalid payment id" });
     }
 
+    const existing = await StudentAndTeacherPaymentsStutus.findOne({
+      _id: new ObjectId(id),
+    });
+    if (!existing) {
+      return res.status(404).json({ message: "Payment not found" });
+    }
+
     const { status, payment } = req.body || {};
     const nextStatus = String(status || "").trim().toLowerCase();
     const isPaid = typeof payment === "boolean" ? payment : nextStatus === "paid";
+
+    // হিন্ট: অ্যাডমিন paid করলে রশিদে মেয়াদ না থাকলে সেটিও তৈরি করা হচ্ছে।
+    // হিন্ট: pending/refund হলে planExpiresAt null হয়ে ইউজারের প্ল্যান বন্ধ হবে।
+    const durationDays = Number(existing.durationDays) || 30;
+    const planExpiresAt = isPaid
+      ? new Date(
+          existing.planExpiresAt &&
+            new Date(existing.planExpiresAt).getTime() > Date.now()
+            ? existing.planExpiresAt
+            : Date.now() + durationDays * 24 * 60 * 60 * 1000
+        )
+      : null;
 
     const result = await StudentAndTeacherPaymentsStutus.updateOne(
       { _id: new ObjectId(id) },
@@ -1415,13 +1491,15 @@ app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
         $set: {
           status: nextStatus || (isPaid ? "paid" : "pending"),
           payment: isPaid,
+          planExpiresAt,
           updatedAt: new Date(),
         },
       }
     );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ message: "Payment not found" });
+    // হিন্ট: স্ট্যাটাস বদলালে ইউজারের planExpiresAt রশিদের সাথে মিলিয়ে নেওয়া হচ্ছে।
+    if (existing.email) {
+      await syncUserPlanFromReceipts(existing.email);
     }
 
     return res.status(200).json({ message: "Payment updated", result });
@@ -1433,7 +1511,7 @@ app.patch("/UpdatePaymentStatus/:id", async (req, res) => {
 
 // হিন্ট: Admin প্যানেল থেকে পেমেন্ট রেকর্ড মুছে ফেলা হচ্ছে।
 // হিন্ট: অপ্রয়োজনীয় বা ভুল রেকর্ড ডিলিট করার জন্য।
-// হিন্ট: ObjectId যাচাই করে deleteOne চালানো হয়েছে।
+// হিন্ট: রেকর্ড মুছলে সেই ইউজারের প্ল্যানও রশিদের ভিত্তিতে আবার হিসাব করা হচ্ছে।
 app.delete("/DeletePayment/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1441,12 +1519,19 @@ app.delete("/DeletePayment/:id", async (req, res) => {
       return res.status(400).json({ message: "Invalid payment id" });
     }
 
+    const existing = await StudentAndTeacherPaymentsStutus.findOne({
+      _id: new ObjectId(id),
+    });
+    if (!existing) {
+      return res.status(404).json({ message: "Payment not found" });
+    }
+
     const result = await StudentAndTeacherPaymentsStutus.deleteOne({
       _id: new ObjectId(id),
     });
 
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ message: "Payment not found" });
+    if (existing.email) {
+      await syncUserPlanFromReceipts(existing.email);
     }
 
     return res.status(200).json({ message: "Payment deleted", result });
